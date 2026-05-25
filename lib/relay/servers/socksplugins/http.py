@@ -381,7 +381,11 @@ class HTTPSocksRelay(SocksRelay):
             return cookie_header  # On error, pass through unchanged
 
     def transferResponse(self, initial_data=None):
+        original_timeout = None
         try:
+            if self.relaySocket:
+                original_timeout = self.relaySocket.gettimeout()
+
             if initial_data:
                 data = initial_data
             else:
@@ -390,30 +394,11 @@ class HTTPSocksRelay(SocksRelay):
                 LOG.debug('HTTP: No data received from relay socket - connection may be closed')
                 return
 
-            # === DEBUG: Log response details ===
-            try:
-                status_line = data.split(b'\r\n')[0].decode('utf-8', errors='replace')
-                _dbg('<<< RESPONSE: %s' % status_line)
-
-                # Log key headers for ALL responses
-                headers = self.getHeaders(data)
-                if 'www-authenticate' in headers:
-                    _dbg('<<< WWW-Authenticate: %s' % headers['www-authenticate'])
-                if 'set-cookie' in headers:
-                    _dbg('<<< Set-Cookie: %s' % headers['set-cookie'])
-
-                # Check for 401 Unauthorized or 400 Bad Request
-                if ' 401 ' in status_line or ' 400 ' in status_line:
-                    headerSize = data.find(EOL+EOL)
-                    if headerSize != -1:
-                        try:
-                            resp_headers = data[:headerSize].decode('utf-8', errors='replace')
-                            LOG.info('HTTP: Error Response Headers (%s):\n%s' % (status_line.strip(), resp_headers))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            # === END DEBUG ===
+            while EOL+EOL not in data:
+                chunk = self.relaySocket.recv(self.packetSize)
+                if not chunk:
+                    break
+                data += chunk
 
             headerSize = data.find(EOL+EOL)
             if headerSize == -1:
@@ -421,45 +406,97 @@ class HTTPSocksRelay(SocksRelay):
                 self.socksSocket.sendall(data)
                 return
 
+            # === DEBUG: Log response details ===
+            try:
+                status_line = data.split(EOL)[0].decode('utf-8', errors='replace')
+                _dbg('<<< RESPONSE: %s' % status_line)
+                headers = self.getHeaders(data)
+                if 'www-authenticate' in headers:
+                    _dbg('<<< WWW-Authenticate: %s' % headers['www-authenticate'])
+                if 'set-cookie' in headers:
+                    _dbg('<<< Set-Cookie: %s' % headers['set-cookie'])
+                if ' 401 ' in status_line or ' 400 ' in status_line:
+                    try:
+                        resp_headers = data[:headerSize].decode('utf-8', errors='replace')
+                        LOG.info('HTTP: Error Response Headers (%s):\n%s' % (status_line.strip(), resp_headers))
+                    except Exception:
+                        pass
+            except Exception:
+                headers = self.getHeaders(data)
+            # === END DEBUG ===
+
             headers = self.getHeaders(data)
 
-            try:
-                bodySize = int(headers.get('content-length', 0))
-                if bodySize > 0:
-                    readSize = len(data)
-                    expectedTotal = bodySize + headerSize + 4
+            transfer_encoding = headers.get('transfer-encoding', '').lower()
+            if transfer_encoding == 'chunked':
+                self.transferChunked(data, headers)
+                return
 
-                    # Make sure we send the entire response, but don't keep it in memory
-                    self.socksSocket.sendall(data)
-                    while readSize < expectedTotal:
+            headerBlock = data[:headerSize + 4]
+            body = data[headerSize + 4:]
+
+            self.socksSocket.sendall(headerBlock)
+
+            try:
+                status_code = int(data.split(EOL)[0].split()[1])
+            except Exception:
+                status_code = 0
+
+            if 100 <= status_code < 200 or status_code in (204, 304):
+                return
+
+            content_length = headers.get('content-length')
+
+            if content_length is not None:
+                try:
+                    expected_body = int(content_length)
+                except ValueError:
+                    expected_body = None
+
+                if expected_body is not None:
+                    if body:
+                        self.socksSocket.sendall(body)
+                    remaining = expected_body - len(body)
+                    while remaining > 0:
                         try:
-                            data = self.relaySocket.recv(self.packetSize)
-                            if not data:
-                                LOG.debug('HTTP: Connection closed while reading body (read %d of %d)' % (readSize, expectedTotal))
-                                break
-                            readSize += len(data)
-                            self.socksSocket.sendall(data)
-                        except (ConnectionResetError, BrokenPipeError, OSError) as e:
-                            LOG.debug('HTTP: Connection error while reading response body: %s' % str(e))
+                            chunk = self.relaySocket.recv(min(self.packetSize, remaining))
+                        except socket.timeout:
+                            LOG.debug('HTTP: Timeout while reading fixed response body (%d bytes remaining)' % remaining)
                             break
-                    LOG.debug('HTTP: Finished reading response - read %d of %d expected bytes' % (readSize, expectedTotal))
-                else:
-                    # No content-length, check for chunked encoding
-                    if headers.get('transfer-encoding', '').lower() == 'chunked':
-                        # Chunked transfer-encoding
-                        self.transferChunked(data, headers)
-                    else:
-                        # No body in the response, send as-is
-                        self.socksSocket.sendall(data)
-            except (ValueError, KeyError):
-                # Error parsing content-length or other header issues
-                self.socksSocket.sendall(data)
+                        if not chunk:
+                            LOG.debug('HTTP: Relay socket closed with %d response bytes remaining' % remaining)
+                            break
+                        remaining -= len(chunk)
+                        self.socksSocket.sendall(chunk)
+                    LOG.debug('HTTP: Finished fixed response body - expected=%d remaining=%d' % (expected_body, max(remaining, 0)))
+                    return
+
+            if body:
+                self.socksSocket.sendall(body)
+
+            # Fallback for responses delimited by connection close. Use timeout as
+            # the end marker because many IIS/ARR responses keep the socket alive.
+            if self.relaySocket:
+                self.relaySocket.settimeout(25.0)
+            while True:
+                try:
+                    chunk = self.relaySocket.recv(self.packetSize)
+                except socket.timeout:
+                    LOG.debug('HTTP: Response read timeout; treating current response as complete')
+                    break
+                if not chunk:
+                    break
+                self.socksSocket.sendall(chunk)
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             LOG.debug('HTTP: Socket error in transferResponse: %s' % str(e))
-            # Drain relay socket on timeout to prevent garbage in next request
             if 'timed out' in str(e).lower() or 'timeout' in str(e).lower():
                 self._drainRelaySocket()
-            # Don't re-raise, let the caller handle the connection cleanup
+        finally:
+            try:
+                if self.relaySocket and original_timeout is not None:
+                    self.relaySocket.settimeout(original_timeout)
+            except Exception:
+                pass
 
     def _drainRelaySocket(self):
         """
@@ -583,6 +620,156 @@ class HTTPSocksRelay(SocksRelay):
             pass
         return None
 
+    def extractRequestMethod(self, data):
+        """Extract the HTTP method from request data."""
+        try:
+            request_line = data.split(EOL)[0].decode('utf-8', errors='replace')
+            parts = request_line.split(' ')
+            if parts:
+                return parts[0].upper()
+        except Exception:
+            pass
+        return None
+
+    def readCompleteRequest(self, data):
+        """Read the remaining request body from the browser when Content-Length spans packets."""
+        headerSize = data.find(EOL+EOL)
+        if headerSize == -1:
+            return data
+
+        headers = self.getHeaders(data)
+        try:
+            bodySize = int(headers.get('content-length', 0))
+        except (TypeError, ValueError):
+            return data
+
+        expectedTotal = headerSize + 4 + bodySize
+        readSize = len(data)
+        while readSize < expectedTotal:
+            try:
+                chunk = self.socksSocket.recv(min(self.packetSize, expectedTotal - readSize))
+                if not chunk:
+                    break
+                data += chunk
+                readSize += len(chunk)
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                LOG.debug('HTTP: Connection error while reading complete request: %s' % str(e))
+                break
+        return data
+
+    def parseHttpRequest(self, data):
+        """Parse an HTTP request into method, path, headers, and body for HTTPConnection."""
+        data = self.readCompleteRequest(data)
+        headerSize = data.find(EOL+EOL)
+        if headerSize == -1:
+            raise ValueError('Incomplete HTTP request headers')
+
+        headerBlock = data[:headerSize]
+        body = data[headerSize + 4:]
+        requestLine = headerBlock.split(EOL)[0].decode('utf-8', errors='replace')
+        parts = requestLine.split(' ', 2)
+        if len(parts) < 2:
+            raise ValueError('Invalid HTTP request line')
+
+        method = parts[0].upper()
+        path = parts[1]
+        headers = {}
+        for header in headerBlock.split(EOL)[1:]:
+            if b':' not in header:
+                continue
+            key, value = header.split(b':', 1)
+            keyLower = key.lower()
+            if keyLower == b'authorization':
+                continue
+            if keyLower == b'connection':
+                headers['Connection'] = 'Keep-Alive'
+                continue
+            if keyLower == b'cookie':
+                cleaned = self._stripSessionCookie(header)
+                if not cleaned or b':' not in cleaned:
+                    continue
+                key, value = cleaned.split(b':', 1)
+            headers[key.decode('iso-8859-1')] = value.strip().decode('iso-8859-1')
+
+        headers.setdefault('Connection', 'Keep-Alive')
+        return method, path, headers, body
+
+    def processRequestWithHttpConnection(self, buffer, socketLock, protocol='HTTP'):
+        """Send non-idempotent requests through HTTPConnection to avoid raw socket stalls."""
+        method, path, headers, body = self.parseHttpRequest(buffer)
+        relayClient = self.activeRelays[self.username]['protocolClient']
+
+        with socketLock:
+            original_timeout = None
+            try:
+                if relayClient.session.sock is not None:
+                    original_timeout = relayClient.session.sock.gettimeout()
+                    relayClient.session.sock.settimeout(25.0)
+
+                LOG.debug('%s: Forwarding %s %s via authenticated HTTPConnection' % (protocol, method, path))
+                relayClient.session.request(method, path, body=body, headers=headers)
+                response = relayClient.session.getresponse()
+                content_length = response.getheader('Content-Length')
+                try:
+                    expected_length = int(content_length) if content_length is not None else None
+                except ValueError:
+                    expected_length = None
+
+                status = ('HTTP/1.1 %d %s\r\n' % (response.status, response.reason)).encode('iso-8859-1')
+                responseHeaders = []
+                for key, value in response.getheaders():
+                    keyLower = key.lower()
+                    if keyLower in ('content-length', 'transfer-encoding', 'connection'):
+                        continue
+                    responseHeaders.append(('%s: %s\r\n' % (key, value)).encode('iso-8859-1'))
+                if expected_length is not None:
+                    responseHeaders.append(('Content-Length: %d\r\n' % expected_length).encode('iso-8859-1'))
+                    responseHeaders.append(b'Connection: Keep-Alive\r\n')
+                else:
+                    responseHeaders.append(b'Connection: close\r\n')
+
+                self.socksSocket.sendall(status + b''.join(responseHeaders) + b'\r\n')
+
+                bytes_read = 0
+                body_prefix = b''
+                if expected_length is not None:
+                    remaining = expected_length
+                    while remaining > 0:
+                        chunk = response.read(min(self.packetSize, remaining))
+                        if not chunk:
+                            break
+                        if len(body_prefix) < 16:
+                            body_prefix += chunk[:16 - len(body_prefix)]
+                        remaining -= len(chunk)
+                        bytes_read += len(chunk)
+                        self.socksSocket.sendall(chunk)
+                else:
+                    while True:
+                        chunk = response.read(self.packetSize)
+                        if not chunk:
+                            break
+                        if len(body_prefix) < 16:
+                            body_prefix += chunk[:16 - len(body_prefix)]
+                        bytes_read += len(chunk)
+                        self.socksSocket.sendall(chunk)
+
+                LOG.debug('%s: Upstream response %d %s for %s %s, content-length=%s, bytes-read=%d, body-prefix=%r' % (
+                    protocol,
+                    response.status,
+                    response.reason,
+                    method,
+                    path,
+                    content_length,
+                    bytes_read,
+                    body_prefix
+                ))
+            finally:
+                try:
+                    if relayClient.session.sock is not None and original_timeout is not None:
+                        relayClient.session.sock.settimeout(original_timeout)
+                except Exception:
+                    pass
+
     def shouldProbeAnonymous(self):
         """
         Servers with kernel-mode auth (e.g. IIS/HTTP.sys) reset authenticated sessions if
@@ -607,13 +794,16 @@ class HTTPSocksRelay(SocksRelay):
         """
         if not self.shouldProbeAnonymous():
             # Kernel auth mode not enabled, use authenticated relay normally
-            with socketLock:
-                tosend = self.prepareRequest(buffer)
-                self.relaySocket.sendall(tosend)
-                self.transferResponse()
+            self.processRequestWithHttpConnection(buffer, socketLock, protocol=protocol)
             return
 
         relayClient = self.activeRelays[self.username]['protocolClient']
+        method = self.extractRequestMethod(buffer)
+        if method not in ('GET', 'HEAD', 'OPTIONS'):
+            LOG.debug('%s: Skipping anonymous probe for %s request' % (protocol, method or 'unknown'))
+            self.processRequestWithHttpConnection(buffer, socketLock, protocol=protocol)
+            return
+
         path = self.extractRequestPath(buffer)
         tosend = self.prepareRequest(buffer)
 
@@ -625,9 +815,7 @@ class HTTPSocksRelay(SocksRelay):
         if cache_key in authCache and authCache[cache_key]:
             # Cached as needs auth - use authenticated relay directly
             LOG.debug('%s: Cache HIT (auth) %s' % (protocol, path))
-            with socketLock:
-                self.relaySocket.sendall(tosend)
-                self.transferResponse()
+            self.processRequestWithHttpConnection(buffer, socketLock, protocol=protocol)
             return
 
         # Try anonymous connection
@@ -640,9 +828,7 @@ class HTTPSocksRelay(SocksRelay):
             anonConn.connect()
         except Exception as e:
             LOG.error('%s: Anon connection failed: %s, using auth relay' % (protocol, str(e)))
-            with socketLock:
-                self.relaySocket.sendall(tosend)
-                self.transferResponse()
+            self.processRequestWithHttpConnection(buffer, socketLock, protocol=protocol)
             return
 
         try:
@@ -658,9 +844,7 @@ class HTTPSocksRelay(SocksRelay):
                     anonConn.close()
                 except Exception:
                     pass
-                with socketLock:
-                    self.relaySocket.sendall(tosend)
-                    self.transferResponse()
+                self.processRequestWithHttpConnection(buffer, socketLock, protocol=protocol)
                 return
 
             # Decision: is it a 401?
@@ -673,9 +857,7 @@ class HTTPSocksRelay(SocksRelay):
                 except Exception:
                     pass
 
-                with socketLock:
-                    self.relaySocket.sendall(tosend)
-                    self.transferResponse()
+                self.processRequestWithHttpConnection(buffer, socketLock, protocol=protocol)
             else:
                 # Success - forward response with initial data we already read
                 LOG.debug('%s: Path %s OK anonymously (cached)' % (protocol, path))
@@ -696,9 +878,7 @@ class HTTPSocksRelay(SocksRelay):
                 anonConn.close()
             except Exception:
                 pass
-            with socketLock:
-                self.relaySocket.sendall(tosend)
-                self.transferResponse()
+            self.processRequestWithHttpConnection(buffer, socketLock, protocol=protocol)
 
     def prepareRequest(self, data):
         # Parse the HTTP data, removing headers that break stuff

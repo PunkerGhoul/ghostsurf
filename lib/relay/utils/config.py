@@ -31,6 +31,7 @@ class NTLMRelayxConfig:
         self.encoding = None
         self.disableMulti = False
         self.keepRelaying = False
+        self.remove_target = False
 
         # Protocol
         self.protocolClients = {}
@@ -74,6 +75,9 @@ class NTLMRelayxConfig:
 
     def setKeepRelaying(self, keepRelaying):
         self.keepRelaying = keepRelaying
+
+    def setRemoveTarget(self, removeTarget):
+        self.remove_target = removeTarget
 
     def setEncoding(self, encoding):
         self.encoding = encoding
